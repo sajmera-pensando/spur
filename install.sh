@@ -26,7 +26,7 @@ REPO="ROCm/spur"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 
 BINARIES="spur spurctld spurd spurdbd"
-SYMLINKS="sbatch srun squeue scancel sinfo sacct scontrol"
+SYMLINKS="sbatch srun squeue scancel sinfo sacct scontrol sdiag"
 
 log()  { echo "==> $*"; }
 err()  { echo "ERROR: $*" >&2; exit 1; }
