@@ -179,7 +179,13 @@ def fmt_uptime(v):
 CLUSTER_DISPLAY = CLUSTER_FILTER or "all clusters"
 
 # --- Instant queries ---
-alive         = q("lab_monitoring_spur_metrics_alive")
+try:
+    _r = subprocess.run(["curl","-sf","--get","--data-urlencode",
+        'query=lab_monitoring_spur_metrics_alive{source="spur_metrics"}',
+        f"{VMURL}/api/v1/query"], capture_output=True, text=True, timeout=5)
+    alive = json.loads(_r.stdout)["data"]["result"][0]["value"][1]
+except:
+    alive = "N/A"
 degraded      = q("lab_monitoring_spur_degraded")
 nodes_total   = q("spur_nodes")
 nodes_idle    = q("spur_nodes_idle")
