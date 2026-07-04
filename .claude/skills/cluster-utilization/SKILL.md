@@ -266,6 +266,14 @@ print(f"  Memory    {gb(mem_alloc)} / {gb(mem_total)} allocated  ({pct(mem_alloc
 gpu_line = "N/A (no GPUs registered)" if no_gpu else f"{gpus_alloc} / {gpus_total} allocated  ({pct(gpus_alloc, gpus_total)})"
 print(f"  GPUs      {gpu_line}")
 try:
+    free_nodes = int(float(nodes_idle)) if nodes_idle != "N/A" else "N/A"
+    free_cpus  = int(float(cpus_total)) - int(float(cpus_alloc)) if cpus_total != "N/A" and cpus_alloc != "N/A" else "N/A"
+    free_gpus  = int(float(gpus_total)) - int(float(gpus_alloc)) if gpus_total != "N/A" and gpus_alloc != "N/A" and not no_gpu else "N/A"
+    gpu_free_str = f" | {free_gpus} free GPUs" if free_gpus != "N/A" else ""
+    print(f"  Free      {free_nodes} idle nodes  |  {free_cpus} free CPUs{gpu_free_str}  (now)")
+except:
+    pass
+try:
     print(f"  Host CPU  {float(host_cpu):.1f}%  load avg: {load1} / {load5} / {load15}")
 except:
     print(f"  Host CPU  {host_cpu}  load avg: {load1} / {load5} / {load15}")
@@ -287,6 +295,61 @@ else:
     util_row("GPU  -- effective",      r_gpue)
 print()
 print(f"  Success rate    {succ_rate}  ({jobs_done} completed / {jobs_fail} failed / {jobs_canc} cancelled)")
+print()
+
+# --- Capacity insights ---
+print("CAPACITY INSIGHTS")
+try:
+    now_ts = int(time.time())
+    step_s = max(3600, HOURS * 3600 // 24)
+
+    if r_nodes_alloc:
+        free_frac = [1.0 - v for v in r_nodes_alloc]
+        avg_free_nodes = sum(free_frac) / len(free_frac)
+        peak_free_frac = max(free_frac)
+        min_free_frac  = min(free_frac)
+
+        start_ts = now_ts - HOURS * 3600
+        ts_list  = [start_ts + i * step_s for i in range(len(free_frac))]
+
+        peak_free_idx  = free_frac.index(peak_free_frac)
+        min_free_idx   = free_frac.index(min_free_frac)
+        peak_free_time = datetime.datetime.fromtimestamp(ts_list[peak_free_idx]).strftime("%m-%d %H:%M")
+        min_free_time  = datetime.datetime.fromtimestamp(ts_list[min_free_idx]).strftime("%m-%d %H:%M")
+
+        try:
+            n_total = int(float(nodes_total))
+            avg_free_n  = avg_free_nodes * n_total
+            peak_free_n = peak_free_frac * n_total
+            min_free_n  = min_free_frac  * n_total
+        except:
+            avg_free_n = peak_free_n = min_free_n = None
+
+        node_str = f" ({avg_free_n:.1f} nodes avg)" if avg_free_n is not None else ""
+        print(f"  Avg free capacity   {avg_free_nodes*100:.1f}%{node_str}  over last {HOURS}h")
+
+        if avg_free_n is not None:
+            print(f"  Most available      {peak_free_time}  →  {peak_free_frac*100:.1f}% free  ({peak_free_n:.0f} nodes)")
+            print(f"  Least available     {min_free_time}  →  {min_free_frac*100:.1f}% free  ({min_free_n:.0f} nodes)")
+        else:
+            print(f"  Most available      {peak_free_time}  →  {peak_free_frac*100:.1f}% free")
+            print(f"  Least available     {min_free_time}  →  {min_free_frac*100:.1f}% free")
+
+        if r_gpua and not no_gpu:
+            gpu_free_frac = [1.0 - v for v in r_gpua]
+            avg_gpu_free  = sum(gpu_free_frac) / len(gpu_free_frac)
+            try:
+                g_total = int(float(gpus_total))
+                print(f"  Avg free GPUs       {avg_gpu_free*100:.1f}%  ({avg_gpu_free*g_total:.1f} GPUs avg)")
+            except:
+                print(f"  Avg free GPUs       {avg_gpu_free*100:.1f}%")
+
+        if HOURS < 168:
+            print(f"  Tip  Run with hours=168 to reveal weekly patterns and day-of-week capacity trends.")
+    else:
+        print("  N/A (insufficient historical data)")
+except Exception as e:
+    print(f"  N/A ({e})")
 print()
 
 # --- GPU Hardware section ---
@@ -459,6 +522,8 @@ for nd in nodes_data:
 print()
 print("=" * W)
 print(f"  Data: VictoriaMetrics @ {VMURL}  |  window: last {HOURS}h")
+if HOURS < 168:
+    print(f"  Tip  Use hours=168 to see weekly capacity patterns and day-of-week utilization trends.")
 print("=" * W)
 print()
 print("TERMINOLOGY")
