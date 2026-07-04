@@ -221,6 +221,7 @@ r_cpue  = qr("spur_jobs_cpus_alloc / spur_nodes_cpus * lab_host_cpu_util_percent
 r_mema  = qr("spur_jobs_memory_alloc_bytes / spur_nodes_memory_bytes", HOURS)
 no_gpu  = gpus_total in ("0", "0.0", "N/A")
 r_gpua  = [] if no_gpu else qr("spur_jobs_gpus_alloc / spur_nodes_gpus", HOURS)
+r_gpue  = [] if no_gpu else qr("avg(lab_gpu_util_percent) / 100", HOURS)
 
 # --- Status ---
 if alive in ("N/A", "0"):
@@ -273,12 +274,61 @@ util_row("CPU  -- effective",          r_cpue)
 util_row("Mem  -- allocated",          r_mema)
 if no_gpu:
     util_row("GPU  -- allocated",      [],  "N/A (no GPUs registered)")
-    util_row("GPU  -- effective",      [],  "N/A (no GPU exporter)")
+    util_row("GPU  -- effective",      [],  "N/A (no GPUs registered)")
 else:
     util_row("GPU  -- allocated",      r_gpua)
-    util_row("GPU  -- effective",      [],  "N/A (no GPU exporter)")
+    util_row("GPU  -- effective",      r_gpue)
 print()
 print(f"  Success rate    {succ_rate}  ({jobs_done} completed / {jobs_fail} failed / {jobs_canc} cancelled)")
+print()
+
+# --- GPU Hardware section ---
+if not no_gpu:
+    CF = CLUSTER_FILTER
+    gpu_util_avg  = q(f"avg(lab_gpu_util_percent{{{CF}}})")
+    gpu_util_max  = q(f"max(lab_gpu_util_percent{{{CF}}})")
+    gpu_pwr_avg   = q(f"avg(lab_gpu_power_watts{{{CF}}})")
+    gpu_pwr_sum   = q(f"sum(lab_gpu_power_watts{{{CF}}})")
+    gpu_temp_avg  = q(f"avg(lab_gpu_temp_celsius{{{CF}}})")
+    gpu_temp_max  = q(f"max(lab_gpu_temp_celsius{{{CF}}})")
+    gpu_ecc_total = q(f"sum(lab_gpu_ecc_errors_total{{{CF}}})")
+    try:
+        gpu_util_avg_s = f"{float(gpu_util_avg):.1f}%"
+        gpu_util_max_s = f"{float(gpu_util_max):.1f}%"
+    except:
+        gpu_util_avg_s = gpu_util_max_s = "N/A"
+    try:
+        gpu_pwr_avg_s = f"{float(gpu_pwr_avg):.0f} W"
+        gpu_pwr_sum_s = f"{float(gpu_pwr_sum):.0f} W"
+    except:
+        gpu_pwr_avg_s = gpu_pwr_sum_s = "N/A"
+    try:
+        gpu_temp_avg_s = f"{float(gpu_temp_avg):.1f} °C"
+        gpu_temp_max_s = f"{float(gpu_temp_max):.0f} °C"
+    except:
+        gpu_temp_avg_s = gpu_temp_max_s = "N/A"
+    ecc_s = gpu_ecc_total if gpu_ecc_total != "N/A" else "N/A"
+    print("GPU HARDWARE  (cluster aggregate)")
+    print(f"  Utilization   avg {gpu_util_avg_s}  |  max {gpu_util_max_s}")
+    print(f"  Power         avg {gpu_pwr_avg_s} per GPU  |  total {gpu_pwr_sum_s}")
+    print(f"  Temperature   avg {gpu_temp_avg_s}  |  max {gpu_temp_max_s}")
+    print(f"  ECC errors    {ecc_s} (cumulative across all GPUs)")
+    print()
+
+# --- NIC section ---
+CF = CLUSTER_FILTER
+nic_links_up    = q(f"sum(lab_nic_link_up{{{CF}}})")
+nic_links_total = q(f"count(lab_nic_link_up{{{CF}}})")
+net_rx_rate     = q(f"sum(irate(lab_host_net_rx_bytes_total{{{CF}}}[5m]))")
+net_tx_rate     = q(f"sum(irate(lab_host_net_tx_bytes_total{{{CF}}}[5m]))")
+def mbps(v):
+    try:
+        return f"{float(v)*8/1e6:.1f} Mbps"
+    except:
+        return "N/A"
+print("NIC  (cluster aggregate, iface=eth2)")
+print(f"  Links         {nic_links_up} / {nic_links_total} up")
+print(f"  Throughput    RX {mbps(net_rx_rate)}  |  TX {mbps(net_tx_rate)}  (5m avg)")
 print()
 
 # --- Per-node breakdown ---
@@ -291,6 +341,27 @@ try:
     nodes_data = json.loads(r2.stdout)["data"]["result"]
 except:
     nodes_data = []
+
+# Fetch per-node GPU aggregates (avg util, avg power, max temp, ecc) in batch
+try:
+    gpu_util_by_node  = {s["metric"].get("serial","?"): float(s["value"][1])
+        for s in json.loads(subprocess.run(["curl","-sf","--get","--data-urlencode",
+            f"query=avg by (serial) (lab_gpu_util_percent{{{CLUSTER_FILTER}}})",
+            f"{VMURL}/api/v1/query"],capture_output=True,text=True,timeout=5).stdout)["data"]["result"]}
+    gpu_pwr_by_node   = {s["metric"].get("serial","?"): float(s["value"][1])
+        for s in json.loads(subprocess.run(["curl","-sf","--get","--data-urlencode",
+            f"query=avg by (serial) (lab_gpu_power_watts{{{CLUSTER_FILTER}}})",
+            f"{VMURL}/api/v1/query"],capture_output=True,text=True,timeout=5).stdout)["data"]["result"]}
+    gpu_temp_by_node  = {s["metric"].get("serial","?"): float(s["value"][1])
+        for s in json.loads(subprocess.run(["curl","-sf","--get","--data-urlencode",
+            f"query=max by (serial) (lab_gpu_temp_celsius{{{CLUSTER_FILTER}}})",
+            f"{VMURL}/api/v1/query"],capture_output=True,text=True,timeout=5).stdout)["data"]["result"]}
+    gpu_ecc_by_node   = {s["metric"].get("serial","?"): int(float(s["value"][1]))
+        for s in json.loads(subprocess.run(["curl","-sf","--get","--data-urlencode",
+            f"query=sum by (serial) (lab_gpu_ecc_errors_total{{{CLUSTER_FILTER}}})",
+            f"{VMURL}/api/v1/query"],capture_output=True,text=True,timeout=5).stdout)["data"]["result"]}
+except:
+    gpu_util_by_node = gpu_pwr_by_node = gpu_temp_by_node = gpu_ecc_by_node = {}
 
 # Fetch cpus_alloc history for all nodes in one range query to compute idle durations
 NODE_STEP = 300  # 5-minute resolution
@@ -356,8 +427,8 @@ def node_idle_info(node):
 NW = max((len(nd["metric"].get("node", "?")) for nd in nodes_data), default=4)
 NW = max(NW, 4)
 print("PER-NODE BREAKDOWN")
-print(f"  {'NODE':<{NW}} {'STATE':<6} {'CPUS':>4} {'CPU_LOAD':>8} {'MEM_ALLOC':>10} {'GPUS':>6} {'IDLE_SINCE':>11} {'IDLE_DUR':>10} {'USED':>4}")
-print(f"  {'-'*NW} {'-'*6} {'-'*4} {'-'*8} {'-'*10} {'-'*6} {'-'*11} {'-'*10} {'-'*4}")
+print(f"  {'NODE':<{NW}} {'STATE':<6} {'CPUS':>4} {'CPU_LOAD':>8} {'MEM_ALLOC':>10} {'GPUS':>6} {'GPU_UTIL':>8} {'PWR/GPU':>7} {'TEMP':>5} {'ECC':>4} {'IDLE_SINCE':>11} {'IDLE_DUR':>10} {'USED':>4}")
+print(f"  {'-'*NW} {'-'*6} {'-'*4} {'-'*8} {'-'*10} {'-'*6} {'-'*8} {'-'*7} {'-'*5} {'-'*4} {'-'*11} {'-'*10} {'-'*4}")
 for nd in nodes_data:
     node = nd["metric"].get("node", "?")
     # spur_node_cpu_load is reported in millicores — divide by 1000 for cores
@@ -372,7 +443,11 @@ for nd in nodes_data:
         state = "idle" if nca in ("0", "0.0", "N/A") else "alloc"
     mem_str = gb(nma)
     gpu_str = "N/A" if ng in ("0", "0.0", "N/A") else f"{nga}/{ng}"
-    print(f"  {node:<{NW}} {state:<6} {nc:>4} {cpu_load:>8.2f} {mem_str:>10} {gpu_str:>6} {idle_since:>11} {idle_dur:>10} {times_used:>4}")
+    util_s = f"{gpu_util_by_node[node]:.0f}%"  if node in gpu_util_by_node else "N/A"
+    pwr_s  = f"{gpu_pwr_by_node[node]:.0f}W"   if node in gpu_pwr_by_node  else "N/A"
+    temp_s = f"{gpu_temp_by_node[node]:.0f}°C" if node in gpu_temp_by_node else "N/A"
+    ecc_s  = str(gpu_ecc_by_node.get(node, "N/A"))
+    print(f"  {node:<{NW}} {state:<6} {nc:>4} {cpu_load:>8.2f} {mem_str:>10} {gpu_str:>6} {util_s:>8} {pwr_s:>7} {temp_s:>5} {ecc_s:>4} {idle_since:>11} {idle_dur:>10} {times_used:>4}")
 
 print()
 print("=" * W)
@@ -382,6 +457,10 @@ print()
 print("TERMINOLOGY")
 print("  idle        Node is registered and healthy but has 0 CPUs/GPUs allocated.")
 print("  alloc       Node has CPUs/GPUs assigned to one or more running jobs.")
+print("  GPU_UTIL    Average utilization % across all GPUs on the node (from hardware exporter).")
+print("  PWR/GPU     Average power draw per GPU in watts.")
+print("  TEMP        Maximum GPU temperature across the node's GPUs (°C).")
+print("  ECC         Cumulative ECC memory error count across the node's GPUs.")
 print("  IDLE_SINCE  Timestamp when the node last transitioned from allocated → idle.")
 print("  IDLE_DUR    How long the node has been continuously idle since IDLE_SINCE.")
 print("  USED        Number of alloc→idle transitions in the window (not individual jobs).")
