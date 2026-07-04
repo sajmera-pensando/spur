@@ -222,6 +222,27 @@ disk_total    = q("lab_host_disk_total_bytes")
 
 # --- Range queries (VictoriaMetrics aggregates server-side) ---
 r_nodes_alloc = qr(f"spur_nodes_alloc{{{CLUSTER_FILTER}}} / spur_nodes{{{CLUSTER_FILTER}}}", HOURS)
+
+def qr_ts(expr, hours=24):
+    """Range query — returns list of (timestamp, float) pairs."""
+    try:
+        now = int(time.time())
+        step = max(3600, hours * 3600 // 24)
+        r = subprocess.run(
+            ["curl", "-sf", "--get",
+             "--data-urlencode", f"query={expr}",
+             "--data-urlencode", f"start={now - hours*3600}",
+             "--data-urlencode", f"end={now}",
+             "--data-urlencode", f"step={step}",
+             f"{VMURL}/api/v1/query_range"],
+            capture_output=True, text=True, timeout=10)
+        d = json.loads(r.stdout)
+        res = d["data"]["result"]
+        return [(int(v[0]), float(v[1])) for v in res[0]["values"]] if res else []
+    except:
+        return []
+
+r_nodes_alloc_ts = qr_ts(f"spur_nodes_alloc{{{CLUSTER_FILTER}}} / spur_nodes{{{CLUSTER_FILTER}}}", HOURS)
 r_cpua  = qr("spur_jobs_cpus_alloc / spur_nodes_cpus", HOURS)
 # effective CPU = allocation ratio * actual host burn — not just reserved slots
 r_cpue  = qr(f"spur_jobs_cpus_alloc{{{CLUSTER_FILTER}}} / spur_nodes_cpus{{{CLUSTER_FILTER}}} * avg(lab_host_cpu_util_percent{{{CLUSTER_FILTER}}}) / 100", HOURS)
@@ -300,41 +321,36 @@ print()
 # --- Capacity insights ---
 print("CAPACITY INSIGHTS")
 try:
-    now_ts = int(time.time())
-    step_s = max(3600, HOURS * 3600 // 24)
-
-    if r_nodes_alloc:
-        free_frac = [1.0 - v for v in r_nodes_alloc]
-        avg_free_nodes = sum(free_frac) / len(free_frac)
-        peak_free_frac = max(free_frac)
-        min_free_frac  = min(free_frac)
-
-        start_ts = now_ts - HOURS * 3600
-        ts_list  = [start_ts + i * step_s for i in range(len(free_frac))]
-
-        peak_free_idx  = free_frac.index(peak_free_frac)
-        min_free_idx   = free_frac.index(min_free_frac)
-        peak_free_time = datetime.datetime.fromtimestamp(ts_list[peak_free_idx]).strftime("%m-%d %H:%M")
-        min_free_time  = datetime.datetime.fromtimestamp(ts_list[min_free_idx]).strftime("%m-%d %H:%M")
-
+    if r_nodes_alloc_ts:
+        free_ts    = [(ts, 1.0 - v) for ts, v in r_nodes_alloc_ts]
+        free_vals  = [v for _, v in free_ts]
+        avg_free   = sum(free_vals) / len(free_vals)
+        peak_free  = max(free_vals)
+        min_free   = min(free_vals)
+        peak_ts    = free_ts[free_vals.index(peak_free)][0]
+        min_ts     = free_ts[free_vals.index(min_free)][0]
+        peak_time  = datetime.datetime.fromtimestamp(peak_ts).strftime("%m-%d %H:%M")
+        min_time   = datetime.datetime.fromtimestamp(min_ts).strftime("%m-%d %H:%M")
         try:
-            n_total = int(float(nodes_total))
-            avg_free_n  = avg_free_nodes * n_total
-            peak_free_n = peak_free_frac * n_total
-            min_free_n  = min_free_frac  * n_total
+            n_total     = int(float(nodes_total))
+            avg_free_n  = avg_free  * n_total
+            peak_free_n = peak_free * n_total
+            min_free_n  = min_free  * n_total
         except:
             avg_free_n = peak_free_n = min_free_n = None
-
         node_str = f" ({avg_free_n:.1f} nodes avg)" if avg_free_n is not None else ""
-        print(f"  Avg free capacity   {avg_free_nodes*100:.1f}%{node_str}  over last {HOURS}h")
-
-        if avg_free_n is not None:
-            print(f"  Most available      {peak_free_time}  →  {peak_free_frac*100:.1f}% free  ({peak_free_n:.0f} nodes)")
-            print(f"  Least available     {min_free_time}  →  {min_free_frac*100:.1f}% free  ({min_free_n:.0f} nodes)")
+        print(f"  Avg free capacity   {avg_free*100:.1f}%{node_str}  over last {HOURS}h")
+        is_flat = (peak_free - min_free) < 0.01
+        if is_flat:
+            print(f"  Allocation pattern  Flat — no variation detected in this window")
+            print(f"                      ({peak_free*100:.1f}% free throughout)")
         else:
-            print(f"  Most available      {peak_free_time}  →  {peak_free_frac*100:.1f}% free")
-            print(f"  Least available     {min_free_time}  →  {min_free_frac*100:.1f}% free")
-
+            if avg_free_n is not None:
+                print(f"  Most available      {peak_time}  →  {peak_free*100:.1f}% free  ({peak_free_n:.0f} nodes)")
+                print(f"  Least available     {min_time}  →  {min_free*100:.1f}% free  ({min_free_n:.0f} nodes)")
+            else:
+                print(f"  Most available      {peak_time}  →  {peak_free*100:.1f}% free")
+                print(f"  Least available     {min_time}  →  {min_free*100:.1f}% free")
         if r_gpua and not no_gpu:
             gpu_free_frac = [1.0 - v for v in r_gpua]
             avg_gpu_free  = sum(gpu_free_frac) / len(gpu_free_frac)
@@ -343,7 +359,6 @@ try:
                 print(f"  Avg free GPUs       {avg_gpu_free*100:.1f}%  ({avg_gpu_free*g_total:.1f} GPUs avg)")
             except:
                 print(f"  Avg free GPUs       {avg_gpu_free*100:.1f}%")
-
         if HOURS < 168:
             print(f"  Tip  Run with hours=168 to reveal weekly patterns and day-of-week capacity trends.")
     else:
