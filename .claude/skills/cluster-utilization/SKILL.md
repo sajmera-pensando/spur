@@ -351,6 +351,47 @@ try:
             else:
                 print(f"  Most available      {peak_time}  →  {peak_free*100:.1f}% free")
                 print(f"  Least available     {min_time}  →  {min_free*100:.1f}% free")
+
+        # Find contiguous windows where free capacity >= threshold
+        THRESHOLDS = [0.75, 0.50]
+        for thresh in THRESHOLDS:
+            runs = []
+            run_start = None
+            run_vals  = []
+            for ts, fv in free_ts:
+                if fv >= thresh:
+                    if run_start is None:
+                        run_start = ts
+                        run_vals  = [fv]
+                    else:
+                        run_vals.append(fv)
+                else:
+                    if run_start is not None:
+                        runs.append((run_start, ts, run_vals))
+                        run_start = None
+                        run_vals  = []
+            if run_start is not None:
+                runs.append((run_start, free_ts[-1][0], run_vals))
+            if not runs:
+                continue
+            runs.sort(key=lambda r: r[1] - r[0], reverse=True)
+            thresh_pct = int(thresh * 100)
+            print(f"  Windows ≥{thresh_pct}% free:")
+            for start_ts2, end_ts2, rvals in runs[:3]:
+                dur_s    = end_ts2 - start_ts2
+                dur_h    = dur_s // 3600
+                dur_m    = (dur_s % 3600) // 60
+                dur_str  = f"{dur_h}h {dur_m}m" if dur_h else f"{dur_m}m"
+                t_start  = datetime.datetime.fromtimestamp(start_ts2).strftime("%m-%d %H:%M")
+                is_open  = (end_ts2 == free_ts[-1][0])
+                t_end    = "now" if is_open else datetime.datetime.fromtimestamp(end_ts2).strftime("%H:%M")
+                avg_r    = sum(rvals) / len(rvals)
+                try:
+                    n_str = f"  ~{avg_r * int(float(nodes_total)):.0f} nodes free"
+                except:
+                    n_str = ""
+                print(f"    {t_start} – {t_end}  ({dur_str})  avg {avg_r*100:.1f}% free{n_str}")
+            break  # show only the highest meaningful threshold
         if r_gpua and not no_gpu:
             gpu_free_frac = [1.0 - v for v in r_gpua]
             avg_gpu_free  = sum(gpu_free_frac) / len(gpu_free_frac)
