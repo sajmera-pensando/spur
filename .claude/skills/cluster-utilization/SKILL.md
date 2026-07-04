@@ -284,7 +284,7 @@ print()
 # --- Per-node breakdown ---
 try:
     r2 = subprocess.run(
-        ["curl", "-sf", "--get", "--data-urlencode", "query=spur_node_cpu_load",
+        ["curl", "-sf", "--get", "--data-urlencode", f"query=spur_node_cpu_load{{{CLUSTER_FILTER}}}",
          f"{VMURL}/api/v1/query"],
         capture_output=True, text=True, timeout=5
     )
@@ -292,27 +292,100 @@ try:
 except:
     nodes_data = []
 
+# Fetch cpus_alloc history for all nodes in one range query to compute idle durations
+NODE_STEP = 300  # 5-minute resolution
+_now = int(time.time())
+try:
+    r3 = subprocess.run(
+        ["curl", "-sf", "--get",
+         "--data-urlencode", f"query=spur_node_cpus_alloc{{{CLUSTER_FILTER}}}",
+         "--data-urlencode", f"start={_now - HOURS*3600}",
+         "--data-urlencode", f"end={_now}",
+         "--data-urlencode", f"step={NODE_STEP}",
+         f"{VMURL}/api/v1/query_range"],
+        capture_output=True, text=True, timeout=15
+    )
+    alloc_history = {
+        s["metric"].get("node", "?"): s["values"]
+        for s in json.loads(r3.stdout)["data"]["result"]
+    }
+except:
+    alloc_history = {}
+
+def node_idle_info(node):
+    """Return (state, idle_since_str, idle_dur_str, times_used) for a node."""
+    vals = alloc_history.get(node, [])
+    if not vals:
+        return "unknown", "N/A", "N/A", 0
+
+    times_used = 0
+    prev_alloc = None
+    for ts, val in vals:
+        alloc = float(val) > 0
+        if prev_alloc is True and not alloc:
+            times_used += 1
+        prev_alloc = alloc
+
+    current_alloc = float(vals[-1][1]) > 0
+    if current_alloc:
+        return "alloc", "—", "—", times_used
+
+    # Walk backwards to find last transition from alloc→idle
+    idle_since_ts = None
+    for i in range(len(vals) - 1, -1, -1):
+        if float(vals[i][1]) > 0:
+            if i + 1 < len(vals):
+                idle_since_ts = int(vals[i + 1][0])
+            break
+
+    if idle_since_ts is None:
+        idle_since_ts = int(vals[0][0])
+
+    idle_dur_s = _now - idle_since_ts
+    d2, r2 = divmod(idle_dur_s, 86400)
+    h2, r2 = divmod(r2, 3600)
+    m2 = r2 // 60
+    parts = []
+    if d2: parts.append(f"{d2}d")
+    if h2: parts.append(f"{h2}h")
+    if m2: parts.append(f"{m2}m")
+    dur_str = " ".join(parts) or "< 1m"
+    since_str = datetime.datetime.fromtimestamp(idle_since_ts).strftime("%m-%d %H:%M")
+    return "idle", since_str, dur_str, times_used
+
+NW = max((len(nd["metric"].get("node", "?")) for nd in nodes_data), default=4)
+NW = max(NW, 4)
 print("PER-NODE BREAKDOWN")
-print(f"  {'NODE':<18} {'STATE':<10} {'CPUS':>6} {'CPU_LOAD':>9} {'MEM_ALLOC':>12} {'GPUS_ALLOC':>10}")
-print(f"  {'-'*18} {'-'*10} {'-'*6} {'-'*9} {'-'*12} {'-'*10}")
+print(f"  {'NODE':<{NW}} {'STATE':<6} {'CPUS':>4} {'CPU_LOAD':>8} {'MEM_ALLOC':>10} {'GPUS':>6} {'IDLE_SINCE':>11} {'IDLE_DUR':>10} {'USED':>4}")
+print(f"  {'-'*NW} {'-'*6} {'-'*4} {'-'*8} {'-'*10} {'-'*6} {'-'*11} {'-'*10} {'-'*4}")
 for nd in nodes_data:
     node = nd["metric"].get("node", "?")
     # spur_node_cpu_load is reported in millicores — divide by 1000 for cores
     cpu_load = float(nd["value"][1]) / 1000
-    nc  = q(f'spur_node_cpus{{node="{node}"}}')
-    nca = q(f'spur_node_cpus_alloc{{node="{node}"}}')
-    nma = q(f'spur_node_memory_alloc_bytes{{node="{node}"}}')
-    nga = q(f'spur_node_gpus_alloc{{node="{node}"}}')
-    ng  = q(f'spur_node_gpus{{node="{node}"}}')
-    state = "idle" if nca in ("0", "0.0", "N/A") else "alloc"
+    nc  = q(f'spur_node_cpus{{node="{node}",{CLUSTER_FILTER}}}')
+    nca = q(f'spur_node_cpus_alloc{{node="{node}",{CLUSTER_FILTER}}}')
+    nma = q(f'spur_node_memory_alloc_bytes{{node="{node}",{CLUSTER_FILTER}}}')
+    nga = q(f'spur_node_gpus_alloc{{node="{node}",{CLUSTER_FILTER}}}')
+    ng  = q(f'spur_node_gpus{{node="{node}",{CLUSTER_FILTER}}}')
+    state, idle_since, idle_dur, times_used = node_idle_info(node)
+    if state == "unknown":
+        state = "idle" if nca in ("0", "0.0", "N/A") else "alloc"
     mem_str = gb(nma)
     gpu_str = "N/A" if ng in ("0", "0.0", "N/A") else f"{nga}/{ng}"
-    print(f"  {node:<18} {state:<10} {nc:>6} {cpu_load:>9.2f} {mem_str:>12} {gpu_str:>10}")
+    print(f"  {node:<{NW}} {state:<6} {nc:>4} {cpu_load:>8.2f} {mem_str:>10} {gpu_str:>6} {idle_since:>11} {idle_dur:>10} {times_used:>4}")
 
 print()
 print("=" * W)
 print(f"  Data: VictoriaMetrics @ {VMURL}  |  window: last {HOURS}h")
 print("=" * W)
+print()
+print("TERMINOLOGY")
+print("  idle        Node is registered and healthy but has 0 CPUs/GPUs allocated.")
+print("  alloc       Node has CPUs/GPUs assigned to one or more running jobs.")
+print("  IDLE_SINCE  Timestamp when the node last transitioned from allocated → idle.")
+print("  IDLE_DUR    How long the node has been continuously idle since IDLE_SINCE.")
+print("  USED        Number of alloc→idle transitions in the window (not individual jobs).")
+print("  Success %   completed / (completed + failed + cancelled + timeout + OOM).")
 ```
 
 ---
