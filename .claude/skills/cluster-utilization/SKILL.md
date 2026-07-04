@@ -217,11 +217,11 @@ disk_total    = q("lab_host_disk_total_bytes")
 r_jobs  = qr("spur_jobs_running > bool 0", HOURS)
 r_cpua  = qr("spur_jobs_cpus_alloc / spur_nodes_cpus", HOURS)
 # effective CPU = allocation ratio * actual host burn — not just reserved slots
-r_cpue  = qr("spur_jobs_cpus_alloc / spur_nodes_cpus * lab_host_cpu_util_percent / 100", HOURS)
+r_cpue  = qr(f"spur_jobs_cpus_alloc{{{CLUSTER_FILTER}}} / spur_nodes_cpus{{{CLUSTER_FILTER}}} * avg(lab_host_cpu_util_percent{{{CLUSTER_FILTER}}}) / 100", HOURS)
 r_mema  = qr("spur_jobs_memory_alloc_bytes / spur_nodes_memory_bytes", HOURS)
 no_gpu  = gpus_total in ("0", "0.0", "N/A")
 r_gpua  = [] if no_gpu else qr("spur_jobs_gpus_alloc / spur_nodes_gpus", HOURS)
-r_gpue  = [] if no_gpu else qr("avg(lab_gpu_util_percent) / 100", HOURS)
+r_gpue  = [] if no_gpu else qr(f"avg(lab_gpu_util_percent{{{CLUSTER_FILTER}}}) / 100", HOURS)
 
 # --- Status ---
 if alive in ("N/A", "0"):
