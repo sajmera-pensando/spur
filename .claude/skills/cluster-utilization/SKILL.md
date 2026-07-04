@@ -117,13 +117,15 @@ def qr(expr, hours=24):
     except:
         return []
 
-def sparkline(vals, width=24):
+def sparkline(vals, width=24, min_range=0.01):
     """Render an 8-level ASCII bar chart, padded to `width` chars."""
     bars = "▁▂▃▄▅▆▇█"
     if not vals:
         return "░" * width
     lo, hi = min(vals), max(vals)
-    if hi == lo:
+    # Don't draw variation for ranges smaller than min_range (default 1%)
+    # — avoids misleading sparklines on near-zero metrics
+    if hi == lo or (hi - lo) < min_range:
         return ("░" if hi == 0 else "█") * len(vals)
     s = "".join(bars[int((v - lo) / (hi - lo) * 7)] for v in vals)
     return s.rjust(width, "░")
