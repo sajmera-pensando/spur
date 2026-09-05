@@ -2768,6 +2768,22 @@ impl SlurmController for ControllerService {
         let label = req.label;
         let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
+        // Effective container for the step: the step's own ContainerSpec when it
+        // set one (srun --container-image), otherwise inherit the parent job's
+        // container config (sbatch --container-image). When the step overrides,
+        // its env is merged over the job's container env (step-wins) so setting
+        // one step variable doesn't silently drop the job's container env.
+        let step_container = match req.container.clone().filter(|c| !c.image.is_empty()) {
+            Some(mut step) => {
+                if let Some(parent) = container_spec_from_job_spec(&job.spec) {
+                    let mut env = parent.env;
+                    env.extend(step.env);
+                    step.env = env;
+                }
+                Some(step)
+            }
+            None => container_spec_from_job_spec(&job.spec),
+        };
         let pmix_tmpdir = self.cluster.config().mpi.pmix_tmpdir.clone();
         let modex_connect_timeout_secs = self.cluster.config().mpi.modex_connect_timeout_secs;
         let modex_fence_timeout_secs = self.cluster.config().mpi.modex_fence_timeout_secs;
@@ -2937,6 +2953,7 @@ impl SlurmController for ControllerService {
             let work_dir = work_dir.clone();
             let environment = environment.clone();
             let step_mpi = mpi.clone();
+            let container = step_container.clone();
             set.spawn(async move {
                 let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
@@ -2962,6 +2979,7 @@ impl SlurmController for ControllerService {
                         pmix_plan,
                         mpi: step_mpi.clone(),
                         pmix_prepared: needs_pmix_prepare,
+                        container,
                     })
                     .await
                     .map_err(|e| {
@@ -3606,6 +3624,24 @@ pub async fn serve(
 
 /// Resolve the target node for a job step. Empty = first allocated (legacy
 /// default); a named node must be one the job holds, else it targets outside it.
+/// Build a step `ContainerSpec` from a parent job's container config, so a
+/// nested `srun` (or one that omits `--container-image`) inherits the job's
+/// container. Returns `None` when the job has no container image.
+fn container_spec_from_job_spec(spec: &spur_core::job::JobSpec) -> Option<ContainerSpec> {
+    let image = spec.container_image.clone().filter(|s| !s.is_empty())?;
+    Some(ContainerSpec {
+        image,
+        mounts: spec.container_mounts.clone(),
+        workdir: spec.container_workdir.clone().unwrap_or_default(),
+        name: spec.container_name.clone().unwrap_or_default(),
+        readonly: spec.container_readonly,
+        mount_home: spec.container_mount_home,
+        env: spec.container_env.clone(),
+        entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
+        remap_root: spec.container_remap_root,
+    })
+}
+
 fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a str, String> {
     if requested.is_empty() {
         return allocated

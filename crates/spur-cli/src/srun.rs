@@ -9,9 +9,9 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    CancelJobRequest, CompleteJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest,
-    JobSpec, JobState, RunStepRequest, StreamJobOutputChunk, StreamJobOutputRequest,
-    SubmitJobRequest,
+    CancelJobRequest, CompleteJobRequest, ContainerSpec, CreateJobStepRequest, GetJobRequest,
+    GetNodeRequest, JobSpec, JobState, RunStepRequest, StreamJobOutputChunk,
+    StreamJobOutputRequest, SubmitJobRequest,
 };
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -159,6 +159,14 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_workdir: Option<String>,
 
+    /// Named container (persists across steps in an allocation)
+    #[arg(long)]
+    pub container_name: Option<String>,
+
+    /// Read-only container rootfs (not yet implemented; rejected at submission)
+    #[arg(long)]
+    pub container_readonly: bool,
+
     /// Mount user home directory in container
     #[arg(long)]
     pub container_mount_home: bool,
@@ -166,6 +174,10 @@ pub struct SrunArgs {
     /// Set environment variable inside container (KEY=VAL)
     #[arg(long)]
     pub container_env: Vec<String>,
+
+    /// Shell command run inside the container before the job script
+    #[arg(long)]
+    pub container_entrypoint: Option<String>,
 
     /// Remap user to root inside container
     #[arg(long)]
@@ -215,6 +227,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     if args.jobid.is_some() && !args.overlap {
         anyhow::bail!("--jobid requires --overlap");
+    }
+
+    if args.container_readonly {
+        anyhow::bail!(
+            "--container-readonly is not yet implemented; the container root would be \
+             writable despite the flag. Omit it rather than rely on a read-only rootfs."
+        );
     }
 
     resolve_srun_env(&matches, &mut args)?;
@@ -608,6 +627,8 @@ fn build_srun_job_spec(
         container_image: args.container_image.clone().unwrap_or_default(),
         container_mounts: args.container_mounts.clone(),
         container_workdir: args.container_workdir.clone().unwrap_or_default(),
+        container_name: args.container_name.clone().unwrap_or_default(),
+        container_readonly: args.container_readonly,
         container_mount_home: args.container_mount_home,
         container_env: args
             .container_env
@@ -617,10 +638,41 @@ fn build_srun_job_spec(
                     .map(|(k, v)| (k.to_string(), v.to_string()))
             })
             .collect(),
+        container_entrypoint: args.container_entrypoint.clone().unwrap_or_default(),
         container_remap_root: args.container_remap_root,
         srun_job: true,
         pty: args.pty,
         ..Default::default()
+    })
+}
+
+/// Build the step's `ContainerSpec` from srun's container flags. Returns `None`
+/// when no image is requested, so the step inherits the parent job's container
+/// config (or runs on the host). srun does not surface name/readonly/entrypoint.
+fn container_spec_from_srun_args(args: &SrunArgs) -> Option<ContainerSpec> {
+    let image = args.container_image.clone()?;
+    if image.is_empty() {
+        return None;
+    }
+    Some(ContainerSpec {
+        image,
+        mounts: args.container_mounts.clone(),
+        workdir: args.container_workdir.clone().unwrap_or_default(),
+        name: args.container_name.clone().unwrap_or_default(),
+        // --container-readonly is rejected at submission (a no-op today), so it
+        // never reaches here as true.
+        readonly: false,
+        mount_home: args.container_mount_home,
+        env: args
+            .container_env
+            .iter()
+            .filter_map(|s| {
+                s.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect(),
+        entrypoint: args.container_entrypoint.clone().unwrap_or_default(),
+        remap_root: args.container_remap_root,
     })
 }
 
@@ -803,6 +855,7 @@ async fn dispatch_step(
             label: args.label,
             mpi: step_mpi.to_string(),
             user: params.user.to_string(),
+            container: container_spec_from_srun_args(args),
         })
         .await
         .context("RunStep dispatch failed")?
@@ -2450,6 +2503,25 @@ mod tests {
         assert!(
             msg.contains("--overlap"),
             "expected --overlap error, got: {msg}"
+        );
+    }
+
+    /// --container-readonly is a no-op in the runtime today, so it is refused at
+    /// submission rather than silently ignored (the #777-class failure mode).
+    #[tokio::test]
+    async fn container_readonly_is_rejected() {
+        let result = main_with_args(vec![
+            "srun".into(),
+            "--container-image=img.sqsh".into(),
+            "--container-readonly".into(),
+            "hostname".into(),
+        ])
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("--container-readonly") && msg.contains("not yet implemented"),
+            "expected a not-yet-implemented rejection, got: {msg}"
         );
     }
 
