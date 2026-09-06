@@ -41,7 +41,10 @@ installed (``pkg-config pmix`` must succeed):
 Install the resulting ``spur_mpi_pmix.so`` on **every agent**, using the same
 glibc as the running ``spurd``. If ``pkg-config pmix`` is missing on agents but
 system PMIx headers exist, compile on the agent with ``gcc -fPIC -shared`` and
-the system PMIx ``-I`` / ``libpmix.so`` path (see :doc:`/deployment/native-host`).
+the **same** tree for ``-I`` and ``libpmix.so`` (see :doc:`/deployment/native-host`).
+Do not mix vendor Open MPI PMIx headers (often 3.x under ``/usr/mpi``) with
+distro OpenPMIx 5 ``libpmix.so.2``. After install, ``ldd`` the plugin and
+confirm it loads the intended ``libpmix``.
 
 ``spurd`` launches multi-rank ``--mpi=pmix`` jobs via per-rank fork and
 ``PMIx_server_setup_fork`` (see :doc:`/deployment/native-host`). Agents need

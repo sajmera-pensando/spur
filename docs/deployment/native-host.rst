@@ -354,6 +354,7 @@ For production, run the agent as a systemd service:
    Restart=on-failure
    RestartSec=3
    User=root
+   LimitMEMLOCK=infinity
    LimitNOFILE=65536
 
    [Install]
@@ -385,9 +386,11 @@ The default can be changed in ``spur.conf``:
 
 .. note::
 
-   With the default ``"unlimited"`` setting, a ``LimitMEMLOCK=infinity`` line on
-   the ``spurd`` systemd unit is no longer required. The agent raises the limit
-   itself while still privileged.
+   With the default ``"unlimited"`` setting, a **root** ``spurd`` raises memlock
+   itself while still privileged, so ``LimitMEMLOCK`` on the unit is optional.
+   An unprivileged agent cannot raise the hard limit. Set
+   ``LimitMEMLOCK=infinity`` on the systemd unit in that case: systemd applies
+   it before dropping to ``User=``. See MPI (PMIx) below.
 
 CPU and Memory Limits (cgroups)
 -------------------------------
@@ -528,19 +531,51 @@ For a system-wide install (``INSTALL_DIR=/opt/spur/bin``), the plugin lands in
 
 - **OpenPMIx runtime** — ``libpmix.so`` on the agent (Spur's plugin links
   against it at load time). Version must satisfy ``[mpi].pmix_min_version``.
+  Confirm with ``ldd spur_mpi_pmix.so | grep pmix``. Sites that ship HPC-X /
+  vendor Open MPI often have a **second** ``libpmix.so.2`` under
+  ``/usr/mpi/...`` (PMIx 3.x). The plugin must load the **same** OpenPMIx the
+  ``.so`` was linked against (typically distro OpenPMIx 5, e.g. Debian
+  ``/usr/lib/x86_64-linux-gnu/pmix2/lib/libpmix.so.2``). Do not point
+  ``LD_LIBRARY_PATH`` at the vendor PMIx for the plugin or the ranks.
 - **Open MPI** — libraries matching how application binaries were built
   (``mpicc``, ``LD_LIBRARY_PATH``, ``OPAL_PREFIX``).
 
 Add ``[mpi]`` to ``spur.conf`` on **all** hosts (controller and agents), with
-``plugin_dir`` matching the install layout. Use an **absolute path** — TOML does
-not expand ``$HOME`` or other environment variables:
+``plugin_dir`` matching **where the ``.so`` actually is**. The code default is
+``/usr/lib/spur``; ``install.sh`` with ``INSTALL_DIR=/opt/spur/bin`` places the
+plugin in ``/opt/spur/lib/spur``. Copying the plugin to one path while leaving
+``plugin_dir`` at the other means ``--mpi=pmix`` never loads it. Use an
+**absolute path** — TOML does not expand ``$HOME``:
 
 .. code-block:: toml
 
    [mpi]
-   plugin_dir = "/home/<user>/spur/lib/spur"   # e.g. when INSTALL_DIR=/home/<user>/spur/bin; or /opt/spur/lib/spur
+   plugin_dir = "/usr/lib/spur"   # or /opt/spur/lib/spur — must match the installed .so
    pmix_tmpdir = "/tmp/spur-pmix"
    pmix_min_version = "4.1.0"
+
+   [rlimits]
+   memlock = "unlimited"
+
+Create the PMIx scratch dir on every agent: ``sudo mkdir -p /tmp/spur-pmix && sudo chmod 1777 /tmp/spur-pmix``.
+
+**``spurd`` for MPI.** Prefer a root agent. ``[rlimits] memlock`` only raises
+the limit while ``spurd`` is still privileged. For an unprivileged agent
+(a systemd ``User=`` other than root), set ``LimitMEMLOCK=infinity`` on the
+unit so systemd raises the hard limit before dropping privileges. Without
+root or that unit limit, ranks often keep a small hard memlock (often 8 MiB);
+UCX then spins in ``ibv_reg_mr`` and ``MPI_Init`` never finishes. Register
+``--address`` with a hostname/IP **other nodes can reach** (not a name that
+resolves to ``127.0.0.1``, and not an internal name if peers use a different
+FQDN). On Ubuntu ``libpmix2t64``, set hash GDS on the **server** (``spurd``
+environment) as well as in rank ``env.sh`` (see below).
+
+.. code-block:: ini
+
+   [Service]
+   User=root
+   LimitMEMLOCK=infinity
+   Environment=PMIX_MCA_gds=hash
 
 **Start or restart daemons** after install or upgrade (controller first, then
 agents). Example on an agent:
@@ -551,7 +586,36 @@ agents). Example on an agent:
    nohup spurd --listen=[::]:6818 --config=/etc/spur/spur.conf \
      --controller http://controller.example:6817 >> /var/log/spurd.log 2>&1 &
 
-**Verify MPI wiring** from a host with CLI access:
+Agent MPI environment (before the first job)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Spur's rank wrapper sources ``${HOME}/spur/mpi/env.sh`` if that file exists
+(submitter's home on the agent). Install it on **every** compute node; homes
+are often not shared. Ubuntu ``libpmix2t64`` needs **hash GDS** on both
+``spurd`` and the ranks — default shmem GDS fails against Spur's PMIx server.
+
+On multi-NIC hosts, pin Open MPI TCP to the IPv4 interface that reaches peer
+agents (``ip -br addr``). Unpinned ``btl=tcp`` may pick docker, overlay, or
+IPv6-only NICs; **several tasks per node across two nodes** then hangs in
+``MPI_Init`` even though a single-node or 1-task-per-node run may succeed.
+
+.. code-block:: bash
+
+   mkdir -p "$HOME/spur/mpi"
+   cat > "$HOME/spur/mpi/env.sh" <<'EOF'
+   export PMIX_MCA_gds=hash                          # Ubuntu libpmix2t64; omit if GDS already works
+   export OPAL_PREFIX=/opt/openmpi                  # prefix used to build the application
+   export LD_LIBRARY_PATH="${OPAL_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+   export OMPI_MCA_btl_tcp_if_include=eth0           # fabric NIC that reaches peer agents
+   export OMPI_MCA_oob_tcp_if_include=eth0
+   EOF
+
+Build the application **on each agent** with that prefix's ``mpicc`` (the
+controller often has no MPI compiler). The binary path in the batch script
+must exist on every allocated node.
+
+**Verify MPI wiring** from a host with CLI access **after** ``env.sh`` and
+the MPI binary are in place:
 
 .. code-block:: bash
 
@@ -559,7 +623,10 @@ agents). Example on an agent:
    sinfo                                    # all agents idle/ready
    srun --mpi=list                          # expect: none, pmix
    srun --mpi=pmix -n4 /path/to/hello_mpi   # single-node smoke test
-   srun --mpi=pmix -N2 -n4 /path/to/hello_mpi   # multi-node smoke test
+   srun --mpi=pmix -N2 -n4 /path/to/hello_mpi   # 4 ranks total (2 per node)
+   # Stronger multi-node check (same layout as a typical sbatch):
+   # srun --mpi=pmix -N2 -n8 /path/to/hello_mpi
+   # or: sbatch with -N 2 --ntasks-per-node=4 --mpi=pmix then srun --mpi=pmix ./hello_mpi
 
 Multi-node ``--mpi=pmix`` requires a **uniform task layout**: ``-n`` must be
 evenly divisible by ``-N`` (same number of tasks on every node). For example,
@@ -646,10 +713,13 @@ With libpmix development files (``pkg-config pmix``):
    sudo install -D target/release/spur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
 
 If ``pkg-config pmix`` is unavailable, compile on the agent against **that
-node's** ``libpmix.so``. Include paths vary by site — common layouts:
+node's** ``libpmix.so``. Include **and** link the **same** tree. Mixing vendor
+Open MPI PMIx **headers** (``/usr/mpi/gcc/openmpi-*/include``, often PMIx 3.x)
+with distro ``libpmix.so.2`` (OpenPMIx 5) produces a plugin that ``dlopen``s
+then fails at runtime (``pmix_min_version``, missing symbols, or
+``pmix_value_load`` crashes). Prefer Debian-style OpenPMIx:
 
-- ``/usr/lib/x86_64-linux-gnu/pmix2/include`` (Debian-style)
-- ``/usr/mpi/gcc/openmpi-*/include`` (Open MPI bundled PMIx headers, e.g. Crusoe)
+- ``/usr/lib/x86_64-linux-gnu/pmix2/include`` (Debian/Ubuntu ``libpmix-dev``)
 
 Example (adjust ``-I`` and ``libpmix`` paths for your agent):
 
@@ -676,24 +746,41 @@ Runtime requirements
 - Application binaries built against the **same** Open MPI install you use at
   runtime (consistent ``LD_LIBRARY_PATH`` / ``OPAL_PREFIX``).
 
-``plugin_dir`` must match where ``install.sh`` placed ``spur_mpi_pmix.so`` (see
-**Install Spur with the MPI plugin** above). Example for ``INSTALL_DIR=/opt/spur/bin``:
+``plugin_dir`` must match where the ``.so`` lives. The code default is
+``/usr/lib/spur``. ``install.sh`` with ``INSTALL_DIR=/opt/spur/bin`` uses
+``/opt/spur/lib/spur`` — set ``plugin_dir`` to that path, or copy the plugin
+to ``/usr/lib/spur``.
 
-.. code-block:: toml
-
-   [mpi]
-   plugin_dir = "/opt/spur/lib/spur"
-   pmix_tmpdir = "/tmp/spur-pmix"
-   pmix_min_version = "4.1.0"
+Complete ``[mpi]`` plus ``env.sh``, hash GDS, and (on multi-NIC hosts) TCP
+interface pinning **before** the first job; see **Agent MPI environment** above.
 
 Submit PMIx jobs
 ~~~~~~~~~~~~~~~~
 
+Finish the agent environment first. Then:
+
 .. code-block:: bash
 
    srun --mpi=pmix -n4 ./hello_mpi
-   srun --mpi=pmix -N2 -n4 ./hello_mpi
-   sbatch --mpi=pmix -n4 batch.sh
+   srun --mpi=pmix -N2 -n8 ./hello_mpi    # 4 ranks/node × 2 nodes; needs TCP NIC pin on multi-NIC hosts
+
+Typical batch script (binary must exist at this path on **every** allocated node):
+
+.. code-block:: bash
+
+   #!/bin/bash
+   #SBATCH -J hello-mpi
+   #SBATCH -N 2
+   #SBATCH --ntasks-per-node=4
+   #SBATCH -t 01:00:00
+   #SBATCH --mpi=pmix
+
+   cd "$SLURM_SUBMIT_DIR"
+   srun --mpi=pmix ./hello_mpi
+
+Submit from a host with ``PATH`` and ``SPUR_CONTROLLER_ADDR`` set. Look for
+``spur-<jobid>.out`` on an allocated agent if homes are not shared. Expect
+eight ``rank=… size=8`` lines.
 
 Inside an interactive allocation (``salloc``), enable PMIx per step:
 
@@ -726,6 +813,8 @@ Application scripts should **avoid**:
 - Forcing ``OMPI_MCA_pmix=ext3x`` on Open MPI 4.1 (use the default ``pmix3x``
   component, or omit the variable).
 - Mixing library paths from different Open MPI installations.
+- Putting distro ``libpmix`` on the application's ``LD_LIBRARY_PATH`` when the
+  binary was built against vendor Open MPI ``pmix3x`` (and the reverse).
 
 Operational notes
 ~~~~~~~~~~~~~~~~~
@@ -749,6 +838,12 @@ Operational notes
 - Multi-rank ``--mpi=pmix`` steps use the same per-rank fork + ``setup_fork``
   path as batch jobs. Spur CPU bind (``--cpu-bind``) and per-rank GPU
   partitioning (``SPUR_JOB_GPUS``) apply through the fork wrapper.
+- Batch stdout (``spur-<jobid>.out``) is often written on an **allocated agent**,
+  not the submission host, when those filesystems are not shared.
+- A job may sit in ``COMPLETING`` after ranks have already printed and
+  ``ExitCode=0:0``. Check the ``.out`` file before assuming ``MPI_Init`` hung.
+  A hang looks like ~100 % CPU on the rank processes and an empty ``.out``
+  until cancel.
 
 Submitting Jobs
 ---------------

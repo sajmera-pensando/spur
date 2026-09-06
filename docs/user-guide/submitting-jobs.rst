@@ -347,6 +347,37 @@ For MPI, the agent sets the ``PMI_*``/``PMIX_*`` ranks (the latter with
 ``--mpi=pmix``) and ``SPUR_PEER_NODES``, so PMI/PMIx launchers run without extra
 wiring.
 
+Open MPI (``--mpi=pmix``)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Spur launches ranks itself (no ``mpirun``). Administrators must install the
+PMIx plugin and ``$HOME/spur/mpi/env.sh`` on every agent first — see
+:doc:`/deployment/native-host`.
+
+Build the binary **on each compute node** with that node's ``mpicc`` (the
+controller may have no MPI compiler). The path in the script must exist on
+every allocated node; home directories are often not shared.
+
+.. code-block:: bash
+
+   #!/bin/bash
+   #SBATCH -J hello-mpi
+   #SBATCH -N 2
+   #SBATCH --ntasks-per-node=4
+   #SBATCH -t 01:00:00
+   #SBATCH --mpi=pmix
+
+   cd "$SLURM_SUBMIT_DIR"
+   srun --mpi=pmix ./hello_mpi
+
+Use ``--mpi=pmix`` on both the batch header and the inner ``srun``. After
+``sbatch``, ``spur-<jobid>.out`` may appear on an allocated node rather than
+the submit host. A successful 8-rank job prints ``rank=0`` … ``rank=7`` with
+``size=8``. Empty output plus ranks stuck at ~100 % CPU means ``MPI_Init`` did
+not finish (often hash GDS, memlock, or Open MPI TCP using the wrong NIC) —
+ask an admin to check the native-host MPI section rather than retrying the
+same script.
+
 Distributed-training rendezvous variables
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

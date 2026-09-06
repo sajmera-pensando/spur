@@ -1012,6 +1012,17 @@ are reloadable.
      - Live
      - Timeout for post-fence modex verification.
 
+.. note::
+
+   ``plugin_dir`` defaults to ``/usr/lib/spur``. Tarball installs
+   (``INSTALL_DIR=/opt/spur/bin``) put ``spur_mpi_pmix.so`` in
+   ``/opt/spur/lib/spur`` — set ``plugin_dir`` to that directory or install the
+   ``.so`` under the default path. Create ``pmix_tmpdir`` on every agent
+   (``chmod 1777``). Ubuntu ``libpmix2t64`` needs ``PMIX_MCA_gds=hash`` on
+   ``spurd`` and in ``$HOME/spur/mpi/env.sh``. Full MPI bring-up, including
+   Open MPI TCP interface pinning on multi-NIC nodes, is in
+   :doc:`/deployment/native-host`.
+
 ``[update]``
 ------------
 

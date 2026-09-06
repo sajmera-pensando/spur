@@ -15,6 +15,7 @@ datetime
 dbd
 deprovision
 dev
+distro
 Dockerfile
 FFI
 fairshare
@@ -23,6 +24,7 @@ GRES
 hostlist
 hyperconverged
 InfiniBand
+HPC
 JSON
 JWT
 keepalive
@@ -40,6 +42,8 @@ MyST
 namespace
 namespaces
 NCCL
+NIC
+NICs
 NSS
 openraft
 OCI
@@ -82,6 +86,7 @@ sdiag
 seccomp
 setgid
 setuid
+shmem
 sinfo
 Slurm
 slurmctld
@@ -109,6 +114,7 @@ sysfs
 systemd
 TOML
 TRES
+UCX
 uid
 gid
 unencrypted
@@ -145,6 +151,7 @@ env
 ExitCode
 failover
 filesystem
+filesystems
 forgeable
 forks
 gapped
