@@ -59,13 +59,16 @@ runs inside the container.
    * - ``--container-name <name>``
      - Persist the container across jobs. Required for ``spur image export``.
    * - ``--container-readonly``
-     - Mount the container root read-only.
+     - Not yet implemented — rejected at submission. (A read-only container
+       root is not enforced yet; the flag is refused rather than silently
+       ignored.)
    * - ``--container-mount-home``
      - Mount your home directory into the container.
    * - ``--container-env KEY=VAL``
      - Set an environment variable inside the container. Repeatable.
-   * - ``--container-entrypoint``
-     - Use the image's entrypoint (``sbatch``).
+   * - ``--container-entrypoint <cmd>``
+     - Shell command run inside the container immediately before the job script
+       (``<cmd> && <script>``). It does not replace the image's ENTRYPOINT.
    * - ``--container-remap-root``
      - Map the job user to root inside the container.
 
@@ -111,6 +114,44 @@ This is what lets an image's own tooling run without spelling out its paths:
 
    # torchrun lives on the image's PATH (/opt/venv/bin), not the host's
    sbatch --container-image registry.example.com/pytorch:latest train.sh
+
+Containerized Job Steps
+-----------------------
+
+``srun`` steps run inside a container too, not just batch jobs. The container
+flags above apply to a step's ``srun`` and behave as follows:
+
+- **Step inside a containerized allocation.** When the batch job was submitted
+  with ``--container-image`` (``sbatch --container-image ...``), a nested
+  ``srun`` step enters that already-running container — it shares the job's
+  image, mounts, and GPU devices. This is the standard Slurm + Pyxis pattern
+  used by multi-node launchers.
+
+- **Step with its own image.** A standalone ``srun --container-image`` (or an
+  ``salloc`` allocation followed by ``srun --container-image``) creates a fresh
+  container for that step. Different steps in one allocation can use different
+  images and mounts.
+
+Allocate first, then run steps from inside the allocation shell. A single step
+fans out one container per allocated node:
+
+.. code-block:: bash
+
+   salloc -N2 --gpus-per-node=8
+   # ...now inside the allocation shell:
+   srun --container-image trainer.sqsh <command>   # one container per node
+
+.. note::
+
+   A step is dispatched to every node in the allocation; per-node targeting of
+   an individual step (``-w``/``--nodelist``) is not yet honored for steps, and
+   ``--overlap`` only applies within an allocation (it keys off
+   ``SPUR_JOB_ID``). For per-node roles (e.g. a Ray head vs. workers), branch on
+   ``$SPUR_NODE_RANK`` inside the step command.
+
+GPU allocation, bind mounts, and cancellation apply per step: a cancelled step
+tears down its container and cleans up its rootfs without affecting the rest of
+the allocation.
 
 Exec Into a Running Container Job
 ---------------------------------

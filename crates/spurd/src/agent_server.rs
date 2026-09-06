@@ -196,10 +196,20 @@ fn start_pmix_launch(
     Ok((guard, plan, per_local_rank_env))
 }
 
+/// Monotonic, never-reused id stamped on each `ActiveStep`. The delayed SIGKILL
+/// escalation compares epochs (not pids) so it can never signal a recycled pid
+/// belonging to a different step that reused the same (job_id, step_id) key.
+static STEP_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_step_epoch() -> u64 {
+    STEP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, Default)]
 struct ActiveStep {
     cancel_requested: bool,
     pid: Option<u32>,
+    epoch: u64,
     /// Spool files the step's stdout/stderr are redirected to, so
     /// `stream_job_output` can tail them live keyed on (job_id, step_id).
     stdout_path: String,
@@ -227,19 +237,32 @@ fn cancelled_step_response() -> RunCommandResponse {
     }
 }
 
-fn signal_step_process_group(pid: u32, signal: i32) {
+/// Signal a step's whole workload. The tracked pid may be an intermediate
+/// parent (a containerized step runs the workload as a grandchild that is PID 1
+/// of its own PID namespace), so a single `kill` on it never reaches the real
+/// process. It walks the `/proc` descendant tree first (before the group signal
+/// can reparent/reap children and empty `/proc/<pid>/children`), then signals
+/// the process group (host steps are group leaders, so this also covers a
+/// double-forked descendant that reparented out of the `/proc` tree).
+/// Best-effort; warns only when the tracked pid cannot be signalled at all.
+fn signal_step_tree(pid: u32, signal: i32) {
     let sig =
         nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
-    let leader = nix::unistd::Pid::from_raw(pid as i32);
-    if let Err(e) = nix::sys::signal::killpg(leader, sig) {
-        if let Err(kill_err) = nix::sys::signal::kill(leader, Some(sig)) {
-            warn!(
-                pid,
-                signal,
-                killpg = %e,
-                kill = %kill_err,
-                "step process group signal failed (step may already have exited)"
-            );
+    let target = nix::unistd::Pid::from_raw(pid as i32);
+    crate::executor::kill_process_tree(pid as i32, sig);
+    if let Err(pg_err) = nix::sys::signal::killpg(target, sig) {
+        // Not a group leader (a container fork), or already gone. Fall back to
+        // the tracked pid so an unsignalable step still surfaces a warning.
+        if let Err(e) = nix::sys::signal::kill(target, Some(sig)) {
+            if e != nix::errno::Errno::ESRCH {
+                warn!(
+                    pid,
+                    signal,
+                    killpg = %pg_err,
+                    kill = %e,
+                    "failed to signal step (it may already have exited)"
+                );
+            }
         }
     }
 }
@@ -314,6 +337,253 @@ async fn step_cancel_requested(
         .await
         .get(&key)
         .is_some_and(|step| step.cancel_requested)
+}
+
+/// Spawn a command, register its PID for cancellation, wait for output.
+/// Shared by the nsenter (Case 1) and plain-host (Case 3) step dispatch paths.
+/// Spawn a tokio step command with stdout/stderr redirected to the per-step
+/// spool files (so `stream_job_output` can tail them live), register its pid for
+/// cancellation, and wait. Returns `Ok(None)` if the step was cancelled before
+/// it could run. Shared by the nsenter (Case 1) and plain-host (Case 3) paths.
+async fn run_tokio_step_to_spool(
+    mut cmd: tokio::process::Command,
+    step_files: crate::executor::StepOutputFiles,
+    active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    step_key: (u32, u32),
+) -> Result<Option<std::process::ExitStatus>, Status> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdout(Stdio::from(step_files.stdout))
+        .stderr(Stdio::from(step_files.stderr))
+        .spawn()
+        .map_err(|e| Status::internal(format!("step command failed to spawn: {e}")))?;
+
+    if let Some(pid) = child.id() {
+        let cancel_now = {
+            let mut steps = active_steps.lock().await;
+            if let Some(step) = steps.get_mut(&step_key) {
+                step.pid = Some(pid);
+                step.cancel_requested
+            } else {
+                false
+            }
+        };
+        if cancel_now {
+            signal_step_tree(pid, nix::sys::signal::Signal::SIGTERM as i32);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Ok(None);
+        }
+    }
+
+    match child.wait().await {
+        Ok(status) => Ok(Some(status)),
+        Err(e) => Err(Status::internal(format!("step command failed: {e}"))),
+    }
+}
+
+/// Launch a step command inside a fresh container rootfs, wiring the step's
+/// stdout/stderr to the per-step spool files (so `stream_job_output` can tail
+/// them live), matching the non-container step path. Used for standalone
+/// `srun --container-image` steps where the parent job is not itself
+/// containerized. Returns `Ok(None)` if the step was cancelled before it ran.
+// A fork/exec helper — each input is a distinct piece of the child's context.
+#[allow(clippy::too_many_arguments)]
+async fn run_containerized_step(
+    container_cfg: crate::container::ContainerConfig,
+    rootfs: std::path::PathBuf,
+    script_path: String,
+    env: HashMap<String, String>,
+    step_files: crate::executor::StepOutputFiles,
+    active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    step_key: (u32, u32),
+    memlock: spur_core::config::MemlockLimit,
+) -> Result<Option<std::process::ExitStatus>, Status> {
+    use std::os::fd::AsRawFd;
+
+    // Sync pipe: child signals readiness (or error) after container_init.
+    let (ready_r, ready_w) =
+        nix::unistd::pipe().map_err(|e| Status::internal(format!("pipe failed: {e}")))?;
+    nix::fcntl::fcntl(
+        &ready_r,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .ok();
+
+    let ready_r_fd = ready_r.as_raw_fd();
+    let ready_w_fd = ready_w.as_raw_fd();
+    // Raw fds of the spool files the step's stdout/stderr are redirected to.
+    let stdout_fd = step_files.stdout.as_raw_fd();
+    let stderr_fd = step_files.stderr.as_raw_fd();
+
+    let rootfs_clone = rootfs.clone();
+    // Start from the image's own config.Env (as `docker run` does and as the
+    // batch container path does), with the job environment layered on top; read
+    // from the rootfs before the fork. Keeps a containerized step consistent with
+    // a containerized batch job (e.g. tools on the image's PATH resolve).
+    let env_clone = spur_net::oci::container_base_env(&rootfs, env);
+    let container_env = container_cfg.container_env.clone();
+    let entrypoint = container_cfg.entrypoint.clone();
+    let script_path_clone = script_path.clone();
+
+    // Reject NUL bytes before forking: a NUL would otherwise degrade the child's
+    // exec to `bash -c ""`, which exits 0 and reports a step that never ran as a
+    // success.
+    for s in [Some(script_path_clone.as_str()), entrypoint.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if s.as_bytes().contains(&0) {
+            return Err(Status::invalid_argument(
+                "container entrypoint or step command contains a NUL byte",
+            ));
+        }
+    }
+
+    match unsafe { nix::unistd::fork().map_err(|e| Status::internal(format!("fork failed: {e}")))? }
+    {
+        nix::unistd::ForkResult::Child => {
+            // === CHILD PROCESS — synchronous only ===
+            drop(ready_r);
+
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                // Wire stdout/stderr to the per-step spool files.
+                libc::dup2(stdout_fd, libc::STDOUT_FILENO);
+                libc::dup2(stderr_fd, libc::STDERR_FILENO);
+            }
+
+            crate::container::close_inherited_fds(ready_w_fd);
+
+            executor::apply_memlock(memlock);
+
+            let hook_env = match crate::container::container_init(&container_cfg, &rootfs_clone) {
+                Ok(env) => env,
+                Err(e) => {
+                    let msg = format!("E:{e:#}");
+                    unsafe {
+                        libc::write(ready_w_fd, msg.as_ptr() as *const _, msg.len());
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            unsafe { libc::write(ready_w_fd, b"OK".as_ptr() as *const _, 2) };
+            drop(ready_w);
+
+            let mut final_env = env_clone;
+            for (k, v) in &container_env {
+                final_env.insert(k.clone(), v.clone());
+            }
+            for (k, v) in hook_env {
+                final_env.insert(k, v);
+            }
+
+            // Probe for a shell in the image (busybox/alpine has no /bin/bash),
+            // matching the batch path in executor.rs.
+            let shell = if std::path::Path::new("/bin/bash").exists() {
+                "/bin/bash"
+            } else {
+                "/bin/sh"
+            };
+            let c_shell = std::ffi::CString::new(shell)
+                .unwrap_or_else(|_| std::ffi::CString::new("/bin/sh").unwrap());
+            // Honor --container-entrypoint, matching the batch path: run the
+            // entrypoint, then the step script, with the same shell. NUL bytes in
+            // these strings were rejected before fork, so CString::new cannot fail
+            // here in practice.
+            let argv: Vec<std::ffi::CString> = if let Some(ref ep) = entrypoint {
+                let cmd = format!("{ep} && {shell} {script_path_clone}");
+                vec![
+                    c_shell.clone(),
+                    std::ffi::CString::new("-c").unwrap_or_default(),
+                    std::ffi::CString::new(cmd).unwrap_or_default(),
+                ]
+            } else {
+                vec![
+                    c_shell.clone(),
+                    std::ffi::CString::new(script_path_clone.as_bytes()).unwrap_or_default(),
+                ]
+            };
+            let c_env: Vec<std::ffi::CString> = final_env
+                .iter()
+                .filter_map(|(k, v)| std::ffi::CString::new(format!("{k}={v}")).ok())
+                .collect();
+            let argv_refs: Vec<&std::ffi::CStr> = argv.iter().map(|s| s.as_c_str()).collect();
+            let env_refs: Vec<&std::ffi::CStr> = c_env.iter().map(|s| s.as_c_str()).collect();
+            let _ = nix::unistd::execve(&c_shell, &argv_refs, &env_refs);
+            // stderr is the step's spool file here; surface the failure like the
+            // batch path rather than exiting silently.
+            eprintln!(
+                "spur: execve {shell} failed: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(127);
+        }
+        nix::unistd::ForkResult::Parent { child: child_pid } => {
+            // === PARENT ===
+            drop(ready_w);
+            // The spool-file fds belong to the child now; close our copies.
+            drop(step_files);
+
+            // Read the ready signal from the child.
+            let mut buf = [0u8; 256];
+            let n = unsafe { libc::read(ready_r_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            drop(ready_r);
+            if n < 2 || &buf[..2] != b"OK" {
+                let msg = if n > 0 {
+                    String::from_utf8_lossy(&buf[..n.max(0) as usize]).to_string()
+                } else {
+                    "container init failed (no status)".to_string()
+                };
+                let _ = unsafe { libc::kill(child_pid.as_raw(), libc::SIGKILL) };
+                let _ = nix::sys::wait::waitpid(child_pid, None);
+                return Err(Status::internal(format!(
+                    "step container init failed: {msg}"
+                )));
+            }
+
+            // Register PID for cancellation.
+            let raw_pid = child_pid.as_raw() as u32;
+            let cancel_now = {
+                let mut steps = active_steps.lock().await;
+                if let Some(step) = steps.get_mut(&step_key) {
+                    step.pid = Some(raw_pid);
+                    step.cancel_requested
+                } else {
+                    false
+                }
+            };
+            if cancel_now {
+                // SIGKILL the whole subtree: the workload is a grandchild that
+                // is PID 1 of its namespace and would ignore SIGTERM from here.
+                crate::executor::kill_process_tree(
+                    child_pid.as_raw(),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = nix::sys::wait::waitpid(child_pid, None);
+                return Ok(None);
+            }
+
+            let wait_result =
+                tokio::task::spawn_blocking(move || nix::sys::wait::waitpid(child_pid, None)).await;
+
+            use std::os::unix::process::ExitStatusExt;
+            let exit_status =
+                match wait_result.unwrap_or(Ok(nix::sys::wait::WaitStatus::Exited(child_pid, 1))) {
+                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                        std::process::ExitStatus::from_raw(code << 8)
+                    }
+                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+                        std::process::ExitStatus::from_raw(sig as i32)
+                    }
+                    _ => std::process::ExitStatus::from_raw(1 << 8),
+                };
+
+            Ok(Some(exit_status))
+        }
+    }
 }
 
 pub struct AgentService {
@@ -516,7 +786,10 @@ impl AgentService {
 
                 for c in &completed {
                     jobs.remove(&c.job_id);
-                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
+                    crate::container::cleanup_rootfs(
+                        &crate::container::job_rootfs_base(c.job_id),
+                        &c.rootfs_mode,
+                    );
                     crate::executor::cleanup_job_spool(c.job_id);
                     if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
@@ -867,6 +1140,27 @@ fn build_nsenter_argv(
     command: &[String],
 ) -> Vec<String> {
     let mut args = entry.nsenter_args();
+
+    // Rootless container (the job has its own user namespace). nsenter's default
+    // behaviour on entering a user namespace is to reset credentials — it calls
+    // setgroups() to drop supplementary groups — but the kernel forbids
+    // setgroups() in an unprivileged user namespace, so that fails with EPERM.
+    // A `setpriv --init-groups` drop would hit the same wall. Neither is needed:
+    // the job user is already mapped inside the namespace (host uid -> the
+    // namespace's root), so entering with --preserve-credentials and no setpriv
+    // runs the command as the correct user without ever touching groups.
+    //
+    // This branch only applies to rootless containers. When spurd is root the
+    // job has no user namespace (root containers use pid/mount only), so the
+    // path below — setpriv --init-groups, which preserves GPU groups — is
+    // unchanged.
+    if entry.has_user_namespace {
+        args.push("--preserve-credentials".into());
+        args.push("--".into());
+        args.extend(command.iter().cloned());
+        return args;
+    }
+
     args.push("--".into());
     if let Some(pd) = priv_drop {
         args.extend(pd.setpriv_prefix());
@@ -931,6 +1225,21 @@ impl Drop for StepScriptCleanup {
         let path_refs: Vec<&std::path::Path> =
             self.paths.iter().map(std::path::PathBuf::as_path).collect();
         cleanup_step_scripts(&self.dir, &path_refs);
+    }
+}
+
+/// Removes a step's container rootfs on drop, so a rootfs is torn down even when
+/// the `run_command` future is dropped mid-flight (srun Ctrl-C, client
+/// disconnect, controller RPC timeout) between `setup_rootfs` and the normal
+/// cleanup — otherwise every such attempt leaks an extracted/mounted rootfs.
+struct StepRootfsGuard {
+    base: String,
+    mode: crate::container::RootfsMode,
+}
+
+impl Drop for StepRootfsGuard {
+    fn drop(&mut self) {
+        crate::container::cleanup_rootfs(&self.base, &self.mode);
     }
 }
 
@@ -1347,9 +1656,12 @@ impl SlurmAgent for AgentService {
             )
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
-            let (rootfs, rootfs_mode) =
-                crate::container::setup_rootfs(&image_path, job_id, cfg.name.as_deref())
-                    .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
+            let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
+                &image_path,
+                &crate::container::job_rootfs_base(job_id),
+                cfg.name.as_deref(),
+            )
+            .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
             // Copy user script into rootfs/tmp/ so it's accessible after pivot_root
             let container_script = format!("{}/tmp/spur_job_{}.sh", rootfs.display(), job_id);
@@ -1604,7 +1916,10 @@ impl SlurmAgent for AgentService {
                         // The cgroup handle is this launch's own, so it is always
                         // safe to release.
                         if !running.lock().await.contains_key(&job_id) {
-                            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
+                            crate::container::cleanup_rootfs(
+                                &crate::container::job_rootfs_base(job_id),
+                                &rootfs_mode,
+                            );
                             crate::executor::cleanup_job_spool(job_id);
                         }
                         if let Some(ref cg) = cgroup {
@@ -1790,7 +2105,7 @@ impl SlurmAgent for AgentService {
             }
         };
         if let Some(pid) = pid {
-            signal_step_process_group(pid, signal);
+            signal_step_tree(pid, signal);
         }
         Ok(Response::new(()))
     }
@@ -2021,10 +2336,13 @@ impl SlurmAgent for AgentService {
         let step_id = req.step_id;
         let step_key = (job_id, step_id);
         {
-            self.active_steps
-                .lock()
-                .await
-                .insert(step_key, ActiveStep::default());
+            self.active_steps.lock().await.insert(
+                step_key,
+                ActiveStep {
+                    epoch: next_step_epoch(),
+                    ..Default::default()
+                },
+            );
         }
         let _active_step_guard = ActiveStepGuard {
             steps: self.active_steps.clone(),
@@ -2035,7 +2353,7 @@ impl SlurmAgent for AgentService {
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_entry) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -2047,6 +2365,16 @@ impl SlurmAgent for AgentService {
             } else {
                 tracked.nodelist.clone()
             };
+            let pid = tracked.job.pid().unwrap_or(0);
+            let entry = crate::job_entry::JobEntry {
+                pid: pid as i32,
+                has_pid_namespace: tracked.has_pid_namespace,
+                has_user_namespace: tracked.has_user_namespace,
+                has_mount_namespace: tracked.has_mount_namespace,
+                uid: tracked.uid,
+                gid: tracked.gid,
+                work_dir: tracked.work_dir.clone(),
+            };
             (
                 tracked.gpu_devices.clone(),
                 tracked.partition.clone(),
@@ -2054,6 +2382,7 @@ impl SlurmAgent for AgentService {
                 tracked.memory_mb,
                 nodelist,
                 tracked.mpi.clone(),
+                entry,
             )
         };
 
@@ -2065,18 +2394,18 @@ impl SlurmAgent for AgentService {
             .position(|n| *n == agent_hostname)
             .unwrap_or(0) as u32;
 
-        let mut gpu_env = if gpu_devices.is_empty() {
-            HashMap::new()
+        let (mut gpu_env, container_device_plan) = if gpu_devices.is_empty() {
+            (HashMap::new(), None)
         } else {
-            self.device_registry
+            let (host_plan, container_plan) = self
+                .device_registry
                 .lock()
                 .await
                 .build_job_injection_plans("gpu", &gpu_devices, req.uid, req.gid)
                 .map_err(|e| {
                     Status::failed_precondition(format!("GPU injection plan failed: {}", e))
-                })?
-                .0
-                .env
+                })?;
+            (host_plan.env, Some(container_plan))
         };
         maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
 
@@ -2259,26 +2588,7 @@ impl SlurmAgent for AgentService {
             return Ok(Response::new(cancelled_step_response()));
         }
 
-        let mut cmd = tokio::process::Command::new(&program);
-        cmd.args(&program_args)
-            .current_dir(&work_dir)
-            .process_group(0);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-
         let memlock = self.limits.memlock;
-        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
-        unsafe {
-            cmd.pre_exec(move || {
-                crate::executor::apply_memlock(memlock);
-                if let Some(ref pd) = priv_drop {
-                    pd.apply()
-                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                }
-                Ok(())
-            });
-        }
 
         info!(
             command = ?req.command,
@@ -2286,14 +2596,13 @@ impl SlurmAgent for AgentService {
             task_offset = req.task_offset,
             uid = req.uid,
             work_dir = %work_dir,
+            container_image = req.container.as_ref().map(|c| c.image.as_str()).unwrap_or(""),
+            parent_namespaces = job_entry.has_namespaces(),
             "RunCommand: executing step"
         );
 
-        use std::process::Stdio;
-
-        // Redirect the step's stdout/stderr to per-step spool files rather than
-        // piping the whole output into memory: the child inherits the write fds,
-        // stream_job_output tails the files live, and output stays bounded on this
+        // Redirect the step's stdout/stderr to per-step spool files so
+        // stream_job_output can tail them live and output stays bounded on this
         // node. Paths are recorded in active_steps so the tail can find them.
         let step_files = crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
             .map_err(|e| Status::internal(format!("step output files: {e}")))?;
@@ -2307,32 +2616,238 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        let mut child = cmd
-            .stdout(Stdio::from(step_files.stdout))
-            .stderr(Stdio::from(step_files.stderr))
-            .spawn()
-            .map_err(|e| Status::internal(format!("command failed: {}", e)))?;
-        if let Some(pid) = child.id() {
-            let cancel_now = {
-                let mut steps = self.active_steps.lock().await;
-                if let Some(step) = steps.get_mut(&step_key) {
-                    step.pid = Some(pid);
-                    step.cancel_requested
-                } else {
-                    false
+        // Three dispatch paths, each wiring the step's stdio to the spool files
+        // above. `None` means the step was cancelled before it ran.
+        let maybe_status: Option<std::process::ExitStatus> = if job_entry.has_namespaces()
+            && job_entry.pid > 0
+        {
+            // Case 1: parent job is containerized — enter its namespaces via nsenter
+            // (srun inside sbatch/salloc --container-image).
+            //
+            // If the step asked for its own image, it is not honored here: the
+            // step joins the parent's live container. Leave a trace rather than
+            // silently dropping it (the #777 anti-pattern).
+            if let Some(c) = req.container.as_ref() {
+                if !c.image.is_empty() {
+                    warn!(
+                        job_id,
+                        step_id,
+                        image = %c.image,
+                        "step --container-image ignored: joining the parent job's \
+                         running container instead of building a new one"
+                    );
                 }
-            };
-            if cancel_now {
-                signal_step_process_group(pid, nix::sys::signal::Signal::SIGTERM as i32);
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Ok(Response::new(cancelled_step_response()));
             }
-        }
+            // Enter the step's work_dir *inside* the container by cd-ing in a
+            // shell that runs after nsenter — a host-side chdir does not
+            // survive entering the container's pivoted mount namespace, and
+            // nsenter --wd is unreliable under a rootless user namespace. The
+            // cd is best-effort (`;`, not `&&`) so a work_dir absent inside
+            // the container still runs the command rather than failing it.
+            let inner = shlex::try_join(
+                std::iter::once(program.as_str()).chain(program_args.iter().map(String::as_str)),
+            )
+            .map_err(|e| {
+                Status::invalid_argument(format!("step command is not shell-safe: {e}"))
+            })?;
+            let wd = shlex::try_quote(&work_dir)
+                .map(|s| s.into_owned())
+                .unwrap_or_else(|_| work_dir.clone());
+            let full_command = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("cd {wd} 2>/dev/null; exec {inner}"),
+            ];
+            let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
+            let plan = build_launch_plan(&job_entry, priv_drop.as_ref(), &full_command);
+            let mut cmd = tokio::process::Command::new(&plan.program);
+            // Restore the pre-change unconditional cwd (a plain host or
+            // rootful-namespaced step honours it). Entering a rootless
+            // container's pivoted mount namespace does not preserve it — that
+            // remains best-effort.
+            cmd.args(&plan.args).current_dir(&work_dir).process_group(0);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            if plan.apply_priv_in_child {
+                if let Some(pd) = priv_drop {
+                    unsafe {
+                        cmd.pre_exec(move || {
+                            crate::executor::apply_memlock(memlock);
+                            pd.apply()
+                                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+                        });
+                    }
+                }
+            } else {
+                unsafe {
+                    cmd.pre_exec(move || {
+                        crate::executor::apply_memlock(memlock);
+                        Ok(())
+                    });
+                }
+            }
+            run_tokio_step_to_spool(cmd, step_files, &self.active_steps, step_key).await?
+        } else if req.container.as_ref().is_some_and(|c| !c.image.is_empty()) {
+            // Case 2: standalone srun --container-image with no running parent
+            // container — set up a fresh rootfs for this step.
+            let c = req
+                .container
+                .as_ref()
+                .expect("container present in this arm");
+            let step_uid = req.uid;
+            let step_gid = req.gid;
 
-        let status = match child.wait().await {
-            Ok(status) => status,
-            Err(e) => return Err(Status::internal(format!("command failed: {}", e))),
+            let mounts: Vec<crate::container::BindMount> = c
+                .mounts
+                .iter()
+                .filter_map(|m| crate::container::parse_mount(m).ok())
+                .collect();
+
+            let username = env
+                .get("USER")
+                .or_else(|| env.get("LOGNAME"))
+                .cloned()
+                .unwrap_or_default();
+            let home_dir = env
+                .get("HOME")
+                .cloned()
+                .unwrap_or_else(|| format!("/home/{username}"));
+
+            let container_cfg = crate::container::ContainerConfig {
+                image: c.image.clone(),
+                mounts,
+                workdir: if c.workdir.is_empty() {
+                    None
+                } else {
+                    Some(c.workdir.clone())
+                },
+                name: if c.name.is_empty() {
+                    None
+                } else {
+                    Some(c.name.clone())
+                },
+                readonly: c.readonly,
+                mount_home: c.mount_home,
+                remap_root: c.remap_root,
+                gpu_devices: gpu_devices.clone(),
+                environment: env.clone(),
+                // Deny GPU visibility in container_env for zero-GPU steps, matching
+                // the batch path (launch_job). Without this a user could smuggle
+                // ROCR_VISIBLE_DEVICES=0 through --container-env on a step that
+                // received no GPU allocation.
+                container_env: {
+                    let mut ce = c.env.clone();
+                    maybe_deny_gpu_env(&mut ce, &gpu_devices);
+                    ce
+                },
+                entrypoint: if c.entrypoint.is_empty() {
+                    None
+                } else {
+                    Some(c.entrypoint.clone())
+                },
+                uid: step_uid,
+                gid: step_gid,
+                username: if username.is_empty() {
+                    "spur".to_string()
+                } else {
+                    username
+                },
+                home_dir,
+                device_plan: container_device_plan,
+            };
+
+            let image_path = crate::container::resolve_image(&c.image, None, Some(step_uid))
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+
+            // Per-step rootfs namespace, disjoint from the batch job's
+            // (`job_<id>`), so a step can never resolve to or delete a batch
+            // rootfs, and with no id arithmetic that could overflow.
+            let step_base = crate::container::step_rootfs_base(job_id, step_id);
+            let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
+                &image_path,
+                &step_base,
+                container_cfg.name.as_deref(),
+            )
+            .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
+            // Tear the rootfs down on any exit from here on, including a
+            // dropped future — not just the normal return below.
+            let _rootfs_guard = StepRootfsGuard {
+                base: step_base.clone(),
+                mode: rootfs_mode.clone(),
+            };
+
+            // Write the step command as a script inside the rootfs so it's
+            // accessible after pivot_root hides the host filesystem.
+            let step_script_content = {
+                let joined = shlex::try_join(
+                    std::iter::once(program.as_str())
+                        .chain(program_args.iter().map(String::as_str)),
+                )
+                .map_err(|e| {
+                    Status::invalid_argument(format!("step command is not shell-safe: {e}"))
+                })?;
+                format!("#!/bin/bash\n{joined}\n")
+            };
+            let script_in_rootfs = format!(
+                "{}/tmp/spur_step_{}_{}.sh",
+                rootfs.display(),
+                job_id,
+                step_id
+            );
+            std::fs::write(&script_in_rootfs, &step_script_content)
+                .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &script_in_rootfs,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+
+            // Script path inside the container (after pivot_root, host paths are gone).
+            let script_in_container = format!("/tmp/spur_step_{}_{}.sh", job_id, step_id);
+
+            // The rootfs is cleaned up by `_rootfs_guard` on scope exit
+            // (normal return or dropped future).
+            run_containerized_step(
+                container_cfg,
+                rootfs,
+                script_in_container,
+                env,
+                step_files,
+                &self.active_steps,
+                step_key,
+                memlock,
+            )
+            .await?
+        } else {
+            // Case 3: no container — plain host process.
+            let mut cmd = tokio::process::Command::new(&program);
+            cmd.args(&program_args)
+                .current_dir(&work_dir)
+                .process_group(0);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
+            unsafe {
+                cmd.pre_exec(move || {
+                    crate::executor::apply_memlock(memlock);
+                    if let Some(ref pd) = priv_drop {
+                        pd.apply()
+                            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                    }
+                    Ok(())
+                });
+            }
+            run_tokio_step_to_spool(cmd, step_files, &self.active_steps, step_key).await?
+        };
+
+        let status = match maybe_status {
+            Some(s) => s,
+            None => return Ok(Response::new(cancelled_step_response())),
         };
 
         if let Some(ref task_epilog) = self.hooks.task_epilog {
@@ -3016,6 +3531,7 @@ impl AgentService {
                 .is_some_and(|tracked| tracked.job.is_allocation_only())
         };
         if is_allocation_only {
+            self.cancel_active_steps_for_job(job_id, signal).await;
             self.drop_tracked_job(job_id).await;
             return;
         }
@@ -3045,7 +3561,63 @@ impl AgentService {
         let _ = tracked.job.kill_signal(sig);
     }
 
-    /// SIGTERM now, escalate to SIGKILL after a 5-second grace period.
+    /// Signal every in-flight step of a job. Allocation-only jobs (standalone
+    /// `srun` / `salloc`) have no tracked batch process that owns the step
+    /// processes, so a job-level cancel must reach the steps directly or they
+    /// orphan. This matters most for a containerized step, whose rootfs is torn
+    /// down only when its `run_command` returns — an unsignaled step would leak
+    /// both the container process and its rootfs.
+    ///
+    /// A containerized step runs as PID 1 of its own PID namespace. Signals from
+    /// an ancestor namespace to a namespace's init are *discarded* unless init
+    /// installed a handler for them — SIGTERM/SIGINT to a `bash`/`sleep` init are
+    /// dropped. Only SIGKILL and SIGSTOP are force-delivered. So the requested
+    /// signal is sent first (graceful for host steps), then SIGKILL after a short
+    /// grace period guarantees a container init dies.
+    async fn cancel_active_steps_for_job(&self, job_id: u32, signal: i32) {
+        // Snapshot (key, pid, epoch) under the lock, then signal *outside* it:
+        // signal_step_tree walks /proc, so holding active_steps across it would
+        // block every concurrent run_command (and the ActiveStepGuard's try_lock
+        // cleanup, which silently skips on contention).
+        let targets: Vec<((u32, u32), u32, u64)> = {
+            let mut steps = self.active_steps.lock().await;
+            let mut targets = Vec::new();
+            for (key, step) in steps.iter_mut() {
+                if key.0 == job_id {
+                    step.cancel_requested = true;
+                    if let Some(pid) = step.pid {
+                        targets.push((*key, pid, step.epoch));
+                    }
+                }
+            }
+            targets
+        };
+        if targets.is_empty() {
+            return;
+        }
+        for (_key, pid, _epoch) in &targets {
+            signal_step_tree(*pid, signal);
+        }
+        // Escalate to SIGKILL: a container-init step ignores the graceful signal.
+        // Compare epochs (not pids) so a step that reused the (job, step) key
+        // with a recycled pid is never signalled.
+        let active_steps = self.active_steps.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            let still: Vec<u32> = {
+                let steps = active_steps.lock().await;
+                targets
+                    .iter()
+                    .filter(|(key, _pid, epoch)| steps.get(key).map(|s| s.epoch) == Some(*epoch))
+                    .map(|(_key, pid, _epoch)| *pid)
+                    .collect()
+            };
+            for pid in still {
+                signal_step_tree(pid, nix::sys::signal::Signal::SIGKILL as i32);
+            }
+        });
+    }
+
     async fn graceful_cancel(&self, job_id: u32) {
         let is_allocation_only = {
             let jobs = self.running.lock().await;
@@ -3053,6 +3625,8 @@ impl AgentService {
                 .is_some_and(|tracked| tracked.job.is_allocation_only())
         };
         if is_allocation_only {
+            self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
+                .await;
             self.drop_tracked_job(job_id).await;
             return;
         }
@@ -3658,6 +4232,34 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "setpriv"),
             "root job must not invoke setpriv: {argv:?}"
+        );
+        let sep = argv.iter().position(|a| a == "--").expect("missing --");
+        assert_eq!(&argv[sep..], &["--", "id"]);
+    }
+
+    /// Rootless container (user namespace): entering must preserve credentials
+    /// and skip setpriv, because setgroups() is forbidden in an unprivileged
+    /// user namespace. The job user is already mapped inside, so no in-namespace
+    /// drop is needed.
+    #[test]
+    fn build_nsenter_argv_rootless_container_preserves_credentials() {
+        let mut entry = nsenter_job_entry(1000, 1000);
+        entry.has_user_namespace = true;
+        let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
+        let argv = build_nsenter_argv(&entry, Some(&pd), &["id".to_string()]);
+
+        assert!(
+            argv.iter().any(|a| a == "--preserve-credentials"),
+            "rootless container entry must preserve credentials: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "setpriv"),
+            "rootless container entry must not invoke setpriv (setgroups is \
+             forbidden in a user namespace): {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--init-groups"),
+            "rootless container entry must not init groups: {argv:?}"
         );
         let sep = argv.iter().position(|a| a == "--").expect("missing --");
         assert_eq!(&argv[sep..], &["--", "id"]);
@@ -4543,6 +5145,170 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
+    /// Regression for #777: a step carrying `container_image` must take the
+    /// container path, not silently run the command on the host. A bogus image
+    /// makes the container path fail at image resolution *before* the command
+    /// would run. The command (`echo`) would exit 0 on the host, so an Ok result
+    /// here would mean the flags were dropped — the exact bug being fixed.
+    #[tokio::test]
+    async fn run_command_with_container_image_takes_container_path_not_host() {
+        let (svc, job_id) = run_command_test_setup().await;
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "would-succeed-on-host".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            container: Some(spur_proto::proto::ContainerSpec {
+                image: "/nonexistent/bogus-step-image.sqsh".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let err = svc
+            .run_command(req)
+            .await
+            .expect_err("a container_image step must not fall through to a host echo");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("not found"),
+            "expected an image-resolution failure, got: {}",
+            err.message()
+        );
+    }
+
+    /// The parent-container (nsenter) path takes precedence over setting up a
+    /// fresh container: a step whose tracked job already has live namespaces must
+    /// enter them, never call `resolve_image`. Proven by the *absence* of the
+    /// image-not-found error even though a bogus image is supplied.
+    #[tokio::test]
+    async fn run_command_enters_parent_namespaces_before_new_container() {
+        let (svc, job_id) = run_command_test_setup().await;
+        {
+            let mut jobs = svc.running.lock().await;
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.has_pid_namespace = true;
+            job.has_mount_namespace = true;
+        }
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "hi".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            container: Some(spur_proto::proto::ContainerSpec {
+                image: "/nonexistent/bogus-step-image.sqsh".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // The nsenter path was taken, not Case 2: the bogus image is never
+        // resolved. On a typical (unprivileged) test runner setns is denied, so
+        // the step comes back as a run with an nsenter trace on stderr — the
+        // observable branch — rather than the "image not found" resolution error.
+        match svc.run_command(req).await {
+            Ok(resp) => {
+                let r = resp.into_inner();
+                assert!(
+                    !r.stdout.contains("not found in [") && !r.stderr.contains("not found in ["),
+                    "namespaced job must nsenter, not resolve a new image: {r:?}"
+                );
+                assert!(
+                    r.exit_code == 0
+                        || r.stderr.to_lowercase().contains("nsenter")
+                        || r.stderr.contains("Operation not permitted")
+                        || !r.stderr.is_empty(),
+                    "expected the nsenter path (success, or an nsenter/permission \
+                     failure on an unprivileged runner), got: {r:?}"
+                );
+            }
+            Err(err) => {
+                // A spawn error (e.g. no nsenter binary) is acceptable, as long as
+                // it is not image resolution — that would mean Case 2 was entered.
+                assert!(
+                    !err.message().contains("not found in ["),
+                    "namespaced job should nsenter, not resolve a new image: {}",
+                    err.message()
+                );
+            }
+        }
+    }
+
+    /// Without a container_image and without namespaces, the step runs directly
+    /// on the host (Case 3) — the flag is what gates the container path.
+    #[tokio::test]
+    async fn run_command_without_container_image_runs_on_host() {
+        let (svc, job_id) = run_command_test_setup().await;
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "host-step".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            ..Default::default()
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout.trim(), "host-step");
+    }
+
+    /// Cancelling an allocation-only job (standalone srun / salloc) must signal
+    /// its in-flight steps, not just drop the tracked allocation. Otherwise a
+    /// containerized step orphans its container and leaks its rootfs. Uses a real
+    /// child in its own process group so the group-targeted signal is observable.
+    #[tokio::test]
+    async fn cancelling_allocation_only_job_signals_inflight_steps() {
+        use std::os::unix::process::CommandExt;
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 77,
+            cpus: 1,
+            ..Default::default()
+        }))
+        .await
+        .expect("register allocation");
+
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        svc.register_test_step(77, 0, Some(child.id())).await;
+
+        svc.graceful_cancel(77).await;
+
+        // The step must be marked cancelled and its process signaled dead.
+        {
+            let steps = svc.active_steps.lock().await;
+            assert!(
+                steps.get(&(77, 0)).unwrap().cancel_requested,
+                "step should be marked cancel_requested"
+            );
+        }
+        // try_wait both reaps the child and reports its exit, avoiding the
+        // zombie-looks-alive trap of a signal-0 probe.
+        let mut exited = false;
+        for _ in 0..50 {
+            if child.try_wait().expect("try_wait").is_some() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(exited, "the in-flight step process must be signaled dead");
+    }
+
     #[tokio::test]
     async fn run_command_uses_provided_work_dir() {
         // The bug repro: the user's workflow is `salloc; srun hostname`.
@@ -4701,7 +5467,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signal_step_process_group_terminates_child_processes() {
+    async fn signal_step_tree_terminates_child_processes() {
         use std::time::Duration;
 
         let mut child = tokio::process::Command::new("bash")
@@ -4713,7 +5479,7 @@ mod tests {
         let pid = child.id().expect("spawned child should have pid");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        signal_step_process_group(pid, nix::sys::signal::Signal::SIGTERM as i32);
+        signal_step_tree(pid, nix::sys::signal::Signal::SIGTERM as i32);
 
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await

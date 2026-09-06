@@ -230,16 +230,28 @@ pub enum RootfsMode {
 /// unsquashfs extraction if not root or mount fails.
 ///
 /// Named containers always use extraction (they persist across jobs).
+/// Rootfs directory base name for a batch job's container.
+pub fn job_rootfs_base(job_id: u32) -> String {
+    format!("job_{job_id}")
+}
+
+/// Rootfs directory base name for a per-step container. Kept in a separate
+/// namespace from `job_rootfs_base` so a step can never resolve to (and later
+/// delete) a batch job's live rootfs, and to avoid any id arithmetic.
+pub fn step_rootfs_base(job_id: u32, step_id: u32) -> String {
+    format!("step_{job_id}_{step_id}")
+}
+
 pub fn setup_rootfs(
     image_path: &Path,
-    job_id: u32,
+    base: &str,
     name: Option<&str>,
 ) -> anyhow::Result<(PathBuf, RootfsMode)> {
     let cdir = container_dir();
     let base_dir = if let Some(name) = name {
         cdir.join(sanitize_name(name))
     } else {
-        cdir.join(format!("job_{}", job_id))
+        cdir.join(base)
     };
 
     // If named container already exists, reuse it
@@ -400,8 +412,8 @@ pub fn parse_mount(spec: &str) -> anyhow::Result<BindMount> {
 /// Clean up an unnamed container rootfs.
 ///
 /// Handles both overlay (unmount) and extracted (rm -rf) modes.
-pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
-    let base_dir = container_dir().join(format!("job_{}", job_id));
+pub fn cleanup_rootfs(base: &str, mode: &RootfsMode) {
+    let base_dir = container_dir().join(base);
     if !base_dir.exists() {
         return;
     }
@@ -1748,8 +1760,24 @@ mod tests {
     #[test]
     fn test_cleanup_rootfs_nonexistent() {
         // Should not panic when cleaning up a rootfs that doesn't exist
-        cleanup_rootfs(999999, &RootfsMode::Extracted);
-        cleanup_rootfs(999998, &RootfsMode::Overlay);
+        cleanup_rootfs(&job_rootfs_base(999999), &RootfsMode::Extracted);
+        cleanup_rootfs(&job_rootfs_base(999998), &RootfsMode::Overlay);
+    }
+
+    #[test]
+    fn step_and_job_rootfs_bases_never_overlap() {
+        // A step must never resolve to a batch job's rootfs dir, and the naming
+        // must not depend on id arithmetic that could overflow or alias.
+        assert_ne!(job_rootfs_base(1), step_rootfs_base(1, 0));
+        assert_ne!(job_rootfs_base(10000), step_rootfs_base(1, 0));
+        // Distinct steps of a job never collide, including large step ids that a
+        // `job_id * 10000 + step_id` scheme would have wrapped or aliased.
+        assert_ne!(step_rootfs_base(1, 0), step_rootfs_base(1, 10000));
+        assert_ne!(step_rootfs_base(1, 2), step_rootfs_base(2, 1));
+        // No batch job id maps onto a step base regardless of magnitude.
+        for job in [0u32, 1, 42, 429_500, u32::MAX] {
+            assert!(!job_rootfs_base(job).starts_with("step_"));
+        }
     }
 
     // --- run_hooks ---
